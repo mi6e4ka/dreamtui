@@ -800,7 +800,7 @@ func (m Model) updateRunning(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.cancelling && m.cancel != nil {
 			m.cancel()
 			m.cancelling = true
-			m.appendLog("останавливаю после текущей операции…")
+			m.appendLog("останавливаю текущие операции…")
 			return m, nil
 		}
 		return m, tea.Quit
@@ -863,6 +863,7 @@ func (m Model) startRun() (tea.Model, tea.Cmd) {
 	opts.ApplyAnyway = m.applyAnyway
 	opts.Mux = m.muxOn
 	opts.RefStream = -1
+	opts.Parallel = app.DefaultParallelEpisodes
 	opts.SegmentWorkers = 8
 	opts.AnchorWorkers = 4
 	opts.WindowSeconds = 30
@@ -1239,7 +1240,9 @@ func (m Model) viewReview() string {
 	b.WriteString("  ")
 	b.WriteString(renderToggle("применять при низкой уверенности", m.applyAnyway, false))
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("offset для каждой серии подбирается автоматически по звуку"))
+	b.WriteString(dimStyle.Render(fmt.Sprintf(
+		"offset подбирается автоматически по звуку · до %d серий одновременно",
+		app.DefaultParallelEpisodes)))
 	b.WriteString("\n")
 	if m.plan.Source == "" {
 		b.WriteString(yellowStyle.Render("! источник видео не выбран — синхронизации не будет"))
@@ -1311,30 +1314,31 @@ func (m Model) viewRunning() string {
 	b.WriteString("\n")
 	elapsed := time.Since(m.started).Seconds()
 	finished := 0
-	current := 0
-	for i, n := range m.order {
+	var active []int
+	for _, n := range m.order {
 		st := m.states[n]
 		if st == nil {
 			continue
 		}
-		if st.Status == "готово" || st.Status == "уже есть" || st.Status == "ошибка" ||
-			strings.Contains(st.Status, "ошибка") || st.Status == "нужна проверка" {
+		if isFinished(st.Status) {
 			finished++
+			continue
 		}
-		if current == 0 && !isFinished(st.Status) {
-			current = i + 1
+		if st.Status != "" && st.Status != "ожидание" {
+			active = append(active, n)
 		}
 	}
-	if current == 0 {
-		current = len(m.order)
-	}
-	header := fmt.Sprintf("%d из %d", current, len(m.order))
-	if current > 0 && current <= len(m.order) {
-		header = fmt.Sprintf("E%02d · %d из %d", m.order[current-1], current, len(m.order))
+	header := fmt.Sprintf("готово %d из %d", finished, len(m.order))
+	if len(active) > 0 {
+		labels := make([]string, len(active))
+		for i, n := range active {
+			labels[i] = fmt.Sprintf("E%02d", n)
+		}
+		header = fmt.Sprintf("%s  ·  %s", strings.Join(labels, " "), header)
 	}
 	b.WriteString(fmt.Sprintf("\n  %s  %s   %s\n\n", m.spinner.View(),
 		textStyle.Render(header),
-		dimStyle.Render(fmt.Sprintf("готово %d · прошло %s", finished, fmtClock(elapsed)))))
+		dimStyle.Render(fmtClock(elapsed))))
 	if m.cancelling {
 		b.WriteString(yellowStyle.Render("  останавливаю… (Esc ещё раз — выйти)"))
 		b.WriteString("\n\n")
@@ -1392,8 +1396,12 @@ func (m Model) viewRunning() string {
 	}
 	b.WriteString("\n")
 	logs := m.logs
-	if len(logs) > 7 {
-		logs = logs[len(logs)-7:]
+	maxLogs := 7
+	if len(active) > 1 {
+		maxLogs = 3
+	}
+	if len(logs) > maxLogs {
+		logs = logs[len(logs)-maxLogs:]
 	}
 	if len(logs) > 0 {
 		b.WriteString(dimStyle.Render(strings.Repeat("─", m.contentWidth())))

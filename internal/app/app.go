@@ -40,6 +40,7 @@ type Options struct {
 	Force          bool
 	Mux            bool
 	RefStream      int
+	Parallel       int
 	SegmentWorkers int
 	AnchorWorkers  int
 	WindowSeconds  float64
@@ -256,8 +257,17 @@ func Discover(ctx context.Context, opts Options) (*Plan, error) {
 	return plan, nil
 }
 
-// Execute runs the plan. Episode failures do not abort the whole run.
+// DefaultParallelEpisodes is the number of episodes processed at once when the
+// caller does not pick a limit.
+const DefaultParallelEpisodes = 4
+
+// Execute runs the plan. Episode failures do not abort the whole run. Up to
+// Options.Parallel episodes are processed concurrently; the report is always
+// ordered by episode number.
 func Execute(ctx context.Context, plan *Plan, opts Options) *Report {
+	if opts.Parallel <= 0 {
+		opts.Parallel = DefaultParallelEpisodes
+	}
 	if opts.SegmentWorkers <= 0 {
 		opts.SegmentWorkers = 8
 	}
@@ -276,145 +286,176 @@ func Execute(ctx context.Context, plan *Plan, opts Options) *Report {
 		}
 	}
 	rep := &Report{Started: time.Now(), Release: plan.Release.Title, OutDir: plan.OutDir}
-	for _, m := range plan.Matches {
-		if !m.Selected {
-			continue
-		}
-		if ctx.Err() != nil {
-			rep.Warnings = append(rep.Warnings, "остановлено пользователем")
-			break
-		}
-		start := time.Now()
-		er := EpisodeReport{
-			Number:    m.Episode.Number,
-			Title:     m.Episode.Title,
-			VideoName: m.VideoName,
-			VideoURL:  m.VideoURL,
-			Status:    "running",
-		}
-		emit(Event{Kind: EventEpisodeStart, Episode: m.Episode.Number, Message: fmt.Sprintf("E%02d: %s", m.Episode.Number, m.Episode.Title)})
-		if _, err := os.Stat(m.OutputPath); err == nil && !opts.Force {
-			er.Status = "exists"
-			er.OutputPath = m.OutputPath
-			title := plan.Release.Title + " — " + m.Episode.Title
-			if opts.Mux && m.VideoURL != "" {
-				muxOut := muxPath(m.OutputPath)
-				if _, statErr := os.Stat(muxOut); statErr != nil || opts.Force {
-					er.MuxPath = muxOut
-					if _, muxErr := muxEpisode(ctx, m, m.OutputPath, 0, title, opts, emit); muxErr != nil {
-						er.MuxError = muxErr.Error()
-						er.Warning = strings.TrimSpace(er.Warning + " mux: " + muxErr.Error())
-					}
-				} else {
-					er.MuxPath = muxOut
-				}
-			}
-			er.Elapsed = time.Since(start).Seconds()
-			rep.Episodes = append(rep.Episodes, er)
-			msg := "уже существует"
-			if er.MuxPath != "" && er.MuxError == "" {
-				msg += ", MKV готов"
-			}
-			emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: &er, Message: msg})
-			continue
-		}
-		if err := os.MkdirAll(plan.OutDir, 0o755); err != nil {
-			er.Status, er.Error = "error", err.Error()
-			er.Elapsed = time.Since(start).Seconds()
-			rep.Episodes = append(rep.Episodes, er)
-			emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: &er, Message: er.Error})
-			continue
-		}
-		epWork := filepath.Join(plan.WorkDir, fmt.Sprintf("s%02d", m.Episode.Number))
-		if err := os.MkdirAll(epWork, 0o755); err != nil {
-			er.Status, er.Error = "error", err.Error()
-			er.Elapsed = time.Since(start).Seconds()
-			rep.Episodes = append(rep.Episodes, er)
-			emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: &er, Message: er.Error})
-			continue
-		}
-		emit(Event{Kind: EventLog, Episode: m.Episode.Number, Message: "скачивание аудио"})
-		dl, err := download.Audio(ctx, m.Episode.OpusURL, m.Episode.AACURL, epWork, download.Options{
-			Workers: opts.SegmentWorkers,
-			Force:   opts.Force,
-			Progress: func(p download.Progress) {
-				emit(Event{Kind: EventDownload, Episode: m.Episode.Number, Download: &p})
-			},
-		})
-		if err != nil {
-			er.Status, er.Error = "download-error", err.Error()
-			er.Elapsed = time.Since(start).Seconds()
-			rep.Episodes = append(rep.Episodes, er)
-			emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: &er, Message: "ошибка загрузки: " + err.Error()})
-			continue
-		}
-		er.AudioPath = dl.Path
-		er.DownloadFrom = dl.Source
-		emit(Event{Kind: EventLog, Episode: m.Episode.Number, Message: fmt.Sprintf("аудио готово: %s, %.1f c", dl.Codec, dl.Duration)})
 
-		videoDur := dl.Duration
-		syncResult, refDesc, refIndex, err := alignEpisode(ctx, m, dl, epWork, opts, emit)
-		if err != nil {
-			er.Status, er.Error = "sync-error", err.Error()
-			er.Elapsed = time.Since(start).Seconds()
-			rep.Episodes = append(rep.Episodes, er)
-			emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: &er, Message: "ошибка синхронизации: " + err.Error()})
-			continue
+	var matches []Match
+	for _, m := range plan.Matches {
+		if m.Selected {
+			matches = append(matches, m)
 		}
-		er.RefStream = refDesc
-		er.RefStreamIdx = refIndex
-		er.Sync = syncResult
-		if syncResult != nil {
-			videoDur = syncResult.VideoDuration
-			if syncResult.Confidence < 0.60 && !opts.ApplyAnyway {
-				er.Status = "needs-confirmation"
-				er.OutputPath = m.OutputPath
-				er.Warning = "низкая уверенность синхронизации; файл не создан"
-				er.Elapsed = time.Since(start).Seconds()
-				rep.Episodes = append(rep.Episodes, er)
-				emit(Event{Kind: EventAlign, Episode: m.Episode.Number, Result: syncResult, Report: &er,
-					Message: fmt.Sprintf("E%02d: offset %+.2f c, confidence %.2f — нужно подтверждение", m.Episode.Number, syncResult.Offset, syncResult.Confidence)})
-				emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: &er, Message: "требуется подтверждение"})
-				continue
-			}
-			for _, w := range syncResult.Warnings {
-				emit(Event{Kind: EventLog, Episode: m.Episode.Number, Message: "предупреждение: " + w})
-				er.Warning = strings.TrimSpace(er.Warning + " " + w)
-			}
+	}
+	workers := opts.Parallel
+	if workers > len(matches) {
+		workers = len(matches)
+	}
+	results := make([]EpisodeReport, 0, len(matches))
+	if workers > 0 {
+		queue := make(chan Match)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for m := range queue {
+					if ctx.Err() != nil {
+						continue
+					}
+					er := runEpisode(ctx, plan, m, opts, emit)
+					mu.Lock()
+					results = append(results, er)
+					mu.Unlock()
+				}
+			}()
 		}
-		title := plan.Release.Title + " — " + m.Episode.Title
-		emit(Event{Kind: EventLog, Episode: m.Episode.Number, Message: fmt.Sprintf("рендер: offset %+.2f, confidence %.2f", syncResult.Offset, syncResult.Confidence)})
-		err = render.Render(ctx, dl.Path, syncResult, render.Options{
-			Output:        m.OutputPath,
-			VideoURL:      m.VideoURL,
-			RefStream:     refIndex,
-			VideoDuration: videoDur,
-			Title:         title,
-			TempDir:       epWork,
-		})
-		if err != nil {
-			er.Status, er.Error = "render-error", err.Error()
-			er.Elapsed = time.Since(start).Seconds()
-			rep.Episodes = append(rep.Episodes, er)
-			emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: &er, Message: "ошибка рендера: " + err.Error()})
-			continue
+		for _, m := range matches {
+			queue <- m
 		}
-		er.OutputPath = m.OutputPath
-		if opts.Mux && m.VideoURL != "" {
-			er.MuxPath = muxPath(m.OutputPath)
-			if _, muxErr := muxEpisode(ctx, m, m.OutputPath, videoDur, title, opts, emit); muxErr != nil {
-				er.MuxError = muxErr.Error()
-				er.Warning = strings.TrimSpace(er.Warning + " mux: " + muxErr.Error())
-			}
-		}
-		er.Status = "done"
-		er.Elapsed = time.Since(start).Seconds()
-		rep.Episodes = append(rep.Episodes, er)
-		emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: &er, Message: "готово: " + filepath.Base(m.OutputPath)})
+		close(queue)
+		wg.Wait()
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].Number < results[j].Number })
+	rep.Episodes = results
+	if ctx.Err() != nil {
+		rep.Warnings = append(rep.Warnings, "остановлено пользователем")
 	}
 	rep.Finished = time.Now()
 	_ = writeReport(plan.OutDir, rep)
 	return rep
+}
+
+// runEpisode extracts, aligns and renders one episode. It is safe to call from
+// several goroutines: all mutable state is local, and events carry the episode
+// number so consumers can attribute them.
+func runEpisode(ctx context.Context, plan *Plan, m Match, opts Options, emit func(Event)) (er EpisodeReport) {
+	start := time.Now()
+	er = EpisodeReport{
+		Number:    m.Episode.Number,
+		Title:     m.Episode.Title,
+		VideoName: m.VideoName,
+		VideoURL:  m.VideoURL,
+		Status:    "running",
+	}
+	// Events are consumed asynchronously, so hand out immutable snapshots
+	// instead of pointers to a struct that keeps changing.
+	snapshot := func() *EpisodeReport {
+		er.Elapsed = time.Since(start).Seconds()
+		cp := er
+		return &cp
+	}
+	emit(Event{Kind: EventEpisodeStart, Episode: m.Episode.Number, Message: fmt.Sprintf("E%02d: %s", m.Episode.Number, m.Episode.Title)})
+	if _, err := os.Stat(m.OutputPath); err == nil && !opts.Force {
+		er.Status = "exists"
+		er.OutputPath = m.OutputPath
+		title := plan.Release.Title + " — " + m.Episode.Title
+		if opts.Mux && m.VideoURL != "" {
+			muxOut := muxPath(m.OutputPath)
+			if _, statErr := os.Stat(muxOut); statErr != nil || opts.Force {
+				er.MuxPath = muxOut
+				if _, muxErr := muxEpisode(ctx, m, m.OutputPath, 0, title, opts, emit); muxErr != nil {
+					er.MuxError = muxErr.Error()
+					er.Warning = strings.TrimSpace(er.Warning + " mux: " + muxErr.Error())
+				}
+			} else {
+				er.MuxPath = muxOut
+			}
+		}
+		msg := "уже существует"
+		if er.MuxPath != "" && er.MuxError == "" {
+			msg += ", MKV готов"
+		}
+		emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: snapshot(), Message: msg})
+		return er
+	}
+	if err := os.MkdirAll(plan.OutDir, 0o755); err != nil {
+		er.Status, er.Error = "error", err.Error()
+		emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: snapshot(), Message: er.Error})
+		return er
+	}
+	epWork := filepath.Join(plan.WorkDir, fmt.Sprintf("s%02d", m.Episode.Number))
+	if err := os.MkdirAll(epWork, 0o755); err != nil {
+		er.Status, er.Error = "error", err.Error()
+		emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: snapshot(), Message: er.Error})
+		return er
+	}
+	emit(Event{Kind: EventLog, Episode: m.Episode.Number, Message: "скачивание аудио"})
+	dl, err := download.Audio(ctx, m.Episode.OpusURL, m.Episode.AACURL, epWork, download.Options{
+		Workers: opts.SegmentWorkers,
+		Force:   opts.Force,
+		Progress: func(p download.Progress) {
+			emit(Event{Kind: EventDownload, Episode: m.Episode.Number, Download: &p})
+		},
+	})
+	if err != nil {
+		er.Status, er.Error = "download-error", err.Error()
+		emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: snapshot(), Message: "ошибка загрузки: " + err.Error()})
+		return er
+	}
+	er.AudioPath = dl.Path
+	er.DownloadFrom = dl.Source
+	emit(Event{Kind: EventLog, Episode: m.Episode.Number, Message: fmt.Sprintf("аудио готово: %s, %.1f c", dl.Codec, dl.Duration)})
+
+	videoDur := dl.Duration
+	syncResult, refDesc, refIndex, err := alignEpisode(ctx, m, dl, epWork, opts, emit)
+	if err != nil {
+		er.Status, er.Error = "sync-error", err.Error()
+		emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: snapshot(), Message: "ошибка синхронизации: " + err.Error()})
+		return er
+	}
+	er.RefStream = refDesc
+	er.RefStreamIdx = refIndex
+	er.Sync = syncResult
+	if syncResult != nil {
+		videoDur = syncResult.VideoDuration
+		if syncResult.Confidence < 0.60 && !opts.ApplyAnyway {
+			er.Status = "needs-confirmation"
+			er.OutputPath = m.OutputPath
+			er.Warning = "низкая уверенность синхронизации; файл не создан"
+			emit(Event{Kind: EventAlign, Episode: m.Episode.Number, Result: syncResult, Report: snapshot(),
+				Message: fmt.Sprintf("E%02d: offset %+.2f c, confidence %.2f — нужно подтверждение", m.Episode.Number, syncResult.Offset, syncResult.Confidence)})
+			emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: snapshot(), Message: "требуется подтверждение"})
+			return er
+		}
+		for _, w := range syncResult.Warnings {
+			emit(Event{Kind: EventLog, Episode: m.Episode.Number, Message: "предупреждение: " + w})
+			er.Warning = strings.TrimSpace(er.Warning + " " + w)
+		}
+	}
+	title := plan.Release.Title + " — " + m.Episode.Title
+	emit(Event{Kind: EventLog, Episode: m.Episode.Number, Message: fmt.Sprintf("рендер: offset %+.2f, confidence %.2f", syncResult.Offset, syncResult.Confidence)})
+	err = render.Render(ctx, dl.Path, syncResult, render.Options{
+		Output:        m.OutputPath,
+		VideoURL:      m.VideoURL,
+		RefStream:     refIndex,
+		VideoDuration: videoDur,
+		Title:         title,
+		TempDir:       epWork,
+	})
+	if err != nil {
+		er.Status, er.Error = "render-error", err.Error()
+		emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: snapshot(), Message: "ошибка рендера: " + err.Error()})
+		return er
+	}
+	er.OutputPath = m.OutputPath
+	if opts.Mux && m.VideoURL != "" {
+		er.MuxPath = muxPath(m.OutputPath)
+		if _, muxErr := muxEpisode(ctx, m, m.OutputPath, videoDur, title, opts, emit); muxErr != nil {
+			er.MuxError = muxErr.Error()
+			er.Warning = strings.TrimSpace(er.Warning + " mux: " + muxErr.Error())
+		}
+	}
+	er.Status = "done"
+	emit(Event{Kind: EventEpisodeDone, Episode: m.Episode.Number, Report: snapshot(), Message: "готово: " + filepath.Base(m.OutputPath)})
+	return er
 }
 
 // muxEpisode appends the aligned audio to a local copy of the source video.

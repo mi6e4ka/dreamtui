@@ -71,7 +71,8 @@ func usage() {
   --force             перезаписать/перекачать
   --mux               дополнительно вшить дорожку в MKV (скачивает видео целиком)
   --ref-index N       индекс оригинальной аудиодорожки в контейнере
-  --workers N         параллельных сегментов (по умолчанию 8)
+  --parallel N        сколько серий обрабатывать одновременно (по умолчанию 4)
+  --workers N         параллельных сегментов на серию (по умолчанию 8)
   --anchors N         параллельных референсных окон (по умолчанию 4)
   --window SEC        длина окна синка (по умолчанию 30)
   --work-dir DIR      папка кэша
@@ -94,6 +95,7 @@ func runExtract(args []string) int {
 	force := fs.Bool("force", false, "overwrite existing files")
 	mux := fs.Bool("mux", false, "also mux into MKV")
 	refIndex := fs.Int("ref-index", -1, "reference audio stream index")
+	parallel := fs.Int("parallel", app.DefaultParallelEpisodes, "episodes processed at once")
 	workers := fs.Int("workers", 8, "parallel segment downloads")
 	anchors := fs.Int("anchors", 4, "parallel reference windows")
 	window := fs.Float64("window", 30, "sync window seconds")
@@ -160,6 +162,7 @@ func runExtract(args []string) int {
 		Force:          *force,
 		Mux:            *mux,
 		RefStream:      *refIndex,
+		Parallel:       *parallel,
 		SegmentWorkers: *workers,
 		AnchorWorkers:  *anchors,
 		WindowSeconds:  *window,
