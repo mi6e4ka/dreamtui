@@ -1,5 +1,7 @@
 # dreamtui
 
+<img width="1185" height="718" alt="image" src="https://github.com/user-attachments/assets/55ff6a71-416c-4ca6-b677-34f1596fa09f" />
+
 Извлекает русскую озвучку Dream Cast с dreamerscast.com, автоматически синхронизирует её с вашим релизом (TorrServer или локальная папка с MKV) и собирает внешнюю дорожку `.mka` для IINA / mpv / VLC.
 
 ## Что делает
