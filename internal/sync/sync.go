@@ -175,7 +175,7 @@ func Align(dub *audio.Envelope, refs []RefWindow, videoDuration, dubDuration flo
 	}
 	res.Anchors = anchors
 
-	if cuts, segments := buildCuts(anchors, videoDuration, res.DurationPrior); len(cuts) > 0 {
+	if cuts, segments := buildCuts(anchors, videoDuration, res.DurationPrior, base); len(cuts) > 0 {
 		res.Cuts = cuts
 		res.Segments = segments
 		res.Uniform = false
@@ -387,27 +387,45 @@ func suppressOutliers(anchors []Anchor) {
 
 func chooseBase(anchors []Anchor) (offset, agreement, strength float64) {
 	type cluster struct {
-		offset float64
-		weight float64
-		count  int
+		mean        float64
+		offsets     []float64
+		weights     []float64
+		weight      float64
+		first, last float64
 	}
 	var clusters []cluster
 	for _, a := range anchors {
 		if a.Score < 0.18 {
 			continue
 		}
+		w := math.Max(a.Score, 0.05)
 		placed := false
 		for i := range clusters {
-			if math.Abs(clusters[i].offset-a.Offset) <= 0.6 {
-				clusters[i].weight += math.Max(a.Score, 0.05)
-				clusters[i].count++
-				clusters[i].offset += (a.Offset - clusters[i].offset) / float64(clusters[i].count)
+			if math.Abs(clusters[i].mean-a.Offset) <= 0.6 {
+				c := &clusters[i]
+				c.offsets = append(c.offsets, a.Offset)
+				c.weights = append(c.weights, w)
+				c.weight += w
+				c.mean += (a.Offset - c.mean) / float64(len(c.offsets))
+				if a.VideoTime < c.first {
+					c.first = a.VideoTime
+				}
+				if a.VideoTime > c.last {
+					c.last = a.VideoTime
+				}
 				placed = true
 				break
 			}
 		}
 		if !placed {
-			clusters = append(clusters, cluster{offset: a.Offset, weight: math.Max(a.Score, 0.05), count: 1})
+			clusters = append(clusters, cluster{
+				mean:    a.Offset,
+				offsets: []float64{a.Offset},
+				weights: []float64{w},
+				weight:  w,
+				first:   a.VideoTime,
+				last:    a.VideoTime,
+			})
 		}
 	}
 	if len(clusters) == 0 {
@@ -423,7 +441,35 @@ func chooseBase(anchors []Anchor) (offset, agreement, strength float64) {
 			best = c
 		}
 	}
-	offset = best.offset
+	// The base is the offset at the start of the episode. A cut can only
+	// increase the offset later, so prefer the lowest well supported state.
+	// False correlation peaks are short lived: require the state to span at
+	// least 20 seconds before it can be the opening offset.
+	threshold := 0.4 * best.weight
+	baseCluster := best
+	for _, c := range clusters {
+		if c.mean >= baseCluster.mean {
+			continue
+		}
+		if c.weight < threshold || c.last-c.first < 20 {
+			continue
+		}
+		baseCluster = c
+	}
+	best = baseCluster
+	// The weighted median is robust to a few poor matches that still land
+	// inside the cluster (they must not drag the whole episode by ~0.1 s).
+	offset = weightedMedian(best.offsets, best.weights)
+	var sum, wsum float64
+	for i, o := range best.offsets {
+		if math.Abs(o-offset) <= 0.25 {
+			sum += o * best.weights[i]
+			wsum += best.weights[i]
+		}
+	}
+	if wsum > 0 {
+		offset = sum / wsum
+	}
 	valid := 0
 	matching := 0
 	for _, a := range anchors {
@@ -431,7 +477,7 @@ func chooseBase(anchors []Anchor) (offset, agreement, strength float64) {
 			continue
 		}
 		valid++
-		if math.Abs(a.Offset-offset) <= 0.6 {
+		if math.Abs(a.Offset-offset) <= 1.0 {
 			matching++
 		}
 	}
@@ -452,7 +498,31 @@ func chooseBase(anchors []Anchor) (offset, agreement, strength float64) {
 	return offset, agreement, strength
 }
 
-func buildCuts(anchors []Anchor, videoDuration, durationPrior float64) ([]Cut, []Segment) {
+func weightedMedian(values, weights []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	type item struct {
+		v, w float64
+	}
+	items := make([]item, len(values))
+	var total float64
+	for i := range values {
+		items[i] = item{values[i], weights[i]}
+		total += weights[i]
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].v < items[j].v })
+	var acc float64
+	for _, it := range items {
+		acc += it.w
+		if acc >= total/2 {
+			return it.v
+		}
+	}
+	return items[len(items)-1].v
+}
+
+func buildCuts(anchors []Anchor, videoDuration, durationPrior, base float64) ([]Cut, []Segment) {
 	valid := make([]Anchor, 0, len(anchors))
 	for _, a := range anchors {
 		if a.Score >= 0.18 {
@@ -462,50 +532,90 @@ func buildCuts(anchors []Anchor, videoDuration, durationPrior float64) ([]Cut, [
 	if len(valid) < 2 {
 		return nil, nil
 	}
-	// Group adjacent anchors with the same offset. Offsets can only grow as
-	// the dub skips material, so a backwards jump is a bad match, not a cut.
-	type group struct {
-		anchors []Anchor
-		offset  float64
+
+	// How much material can the dub possibly have lost? The total offset
+	// growth is bounded by the duration difference (video - dub): the dub
+	// cannot skip more than it is shorter than the video. A small allowance
+	// covers container duration rounding.
+	maxRemoved := durationPrior - base + 0.5
+	if maxRemoved < 0 {
+		maxRemoved = 0
 	}
-	var groups []group
-	for _, a := range valid {
-		if len(groups) == 0 {
-			groups = append(groups, group{anchors: []Anchor{a}, offset: a.Offset})
+
+	const tol = 1.0
+	type group struct {
+		offset      float64
+		first, last float64
+		count       int
+	}
+	groups := []group{{offset: base}}
+	lastInlier := math.Inf(-1)
+	removedTotal := 0.0
+
+	for i, a := range valid {
+		diff := a.Offset - groups[len(groups)-1].offset
+		if math.Abs(diff) <= tol {
+			g := &groups[len(groups)-1]
+			if g.count == 0 {
+				g.first = a.VideoTime
+			}
+			g.last = a.VideoTime
+			g.count++
+			lastInlier = a.VideoTime
 			continue
 		}
-		g := &groups[len(groups)-1]
-		diff := a.Offset - g.offset
-		if math.Abs(diff) <= 0.9 {
-			g.anchors = append(g.anchors, a)
-			g.offset += diff / float64(len(g.anchors))
-		} else if diff > 0.9 {
-			groups = append(groups, group{anchors: []Anchor{a}, offset: a.Offset})
+		if diff < -tol {
+			// Offsets only grow; a backwards jump is a false match.
+			continue
 		}
-		// diff < -0.9: ignore as an outlier; the next good anchor will regroup.
+		// A forward jump is a possible cut. It has to be physically possible:
+		// a cut can never remove more dub than the time elapsed since the last
+		// confirmed anchor.
+		gap := a.VideoTime - lastInlier
+		if !math.IsInf(lastInlier, -1) && diff > gap+1.5 {
+			continue
+		}
+		// Do not accept a jump that would remove more material than the
+		// duration discrepancy allows.
+		if removedTotal+diff > maxRemoved {
+			continue
+		}
+		// A cut has to be sustained: at least two later anchors must agree
+		// with the new offset, unless the new offset matches the duration
+		// prior (the post-cut state at the end of the episode).
+		confirm := 0
+		for j := i + 1; j < len(valid); j++ {
+			b := valid[j]
+			if b.VideoTime > a.VideoTime+600 {
+				break
+			}
+			if math.Abs(b.Offset-a.Offset) <= 1.5 {
+				confirm++
+				if confirm >= 2 {
+					break
+				}
+			}
+		}
+		priorMatch := math.Abs(a.Offset-durationPrior) <= 1.5
+		if confirm < 2 && !priorMatch {
+			continue
+		}
+		removedTotal += diff
+		groups = append(groups, group{offset: a.Offset, first: a.VideoTime, last: a.VideoTime, count: 1})
+		lastInlier = a.VideoTime
 	}
 	if len(groups) < 2 {
 		return nil, nil
 	}
-	// A single-anchor group in the middle of the episode is almost always a
-	// false correlation peak. Keep a single final group only when its offset
-	// agrees with the duration prior (i.e. it is the post-cut state).
-	for i := 1; i < len(groups)-1; i++ {
-		if len(groups[i].anchors) < 2 {
-			groups[i].offset = groups[i-1].offset
-			groups[i].anchors = nil
-		}
-	}
-	if len(groups[len(groups)-1].anchors) < 2 && math.Abs(groups[len(groups)-1].offset-durationPrior) > 1.5 {
-		groups[len(groups)-1].anchors = nil
-	}
-	cleanGroups := groups[:0]
+	// Drop a leading group that never got an anchor (the base may have been
+	// replaced by a later, better supported offset).
+	clean := groups[:0]
 	for _, g := range groups {
-		if len(g.anchors) > 0 {
-			cleanGroups = append(cleanGroups, g)
+		if g.count > 0 {
+			clean = append(clean, g)
 		}
 	}
-	groups = cleanGroups
+	groups = clean
 	if len(groups) < 2 {
 		return nil, nil
 	}
@@ -514,17 +624,15 @@ func buildCuts(anchors []Anchor, videoDuration, durationPrior float64) ([]Cut, [
 	var segments []Segment
 	cursor := 0.0
 	offset := groups[0].offset
-	segments = append(segments, Segment{Start: 0, End: groups[0].anchors[0].VideoTime, SourceStart: -offset, Kind: Dub})
-	if segments[0].End <= 0.01 {
-		segments = segments[:0]
-	} else {
-		cursor = segments[0].End
+	if groups[0].first > 0.01 {
+		segments = append(segments, Segment{Start: 0, End: groups[0].first, SourceStart: -offset, Kind: Dub})
+		cursor = groups[0].first
 	}
 	for i := 1; i < len(groups); i++ {
 		prev := groups[i-1]
 		next := groups[i]
-		anchorStart := prev.anchors[len(prev.anchors)-1].VideoTime
-		anchorEnd := next.anchors[0].VideoTime
+		anchorStart := prev.last
+		anchorEnd := next.first
 		if anchorStart < cursor {
 			anchorStart = cursor
 		}

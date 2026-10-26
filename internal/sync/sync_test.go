@@ -118,6 +118,99 @@ func TestAlignDetectsCut(t *testing.T) {
 	}
 }
 
+// TestAlignIgnoresLeadingFalseMatch reproduces an episode where the opening
+// reference window has a stronger match near the end of the dub (repeated
+// music/recap). The first anchor then reports a huge negative offset; that
+// must not become a cut at 00:00 that shifts the whole track.
+func TestAlignIgnoresLeadingFalseMatch(t *testing.T) {
+	const offset = -5.53
+	const videoDur = 1377.168
+	const dubDur = 1381.807 // duration prior = -4.639
+	dub := smoothSignal(dubDur, 53)
+	var refs []RefWindow
+	// The first window is a false match: it is a copy of the dub near its end.
+	refs = append(refs, RefWindow{
+		VideoTime: 0,
+		Envelope:  makeEnvelope(sliceEnv(dub, 1285.11, 30)),
+	})
+	for _, vt := range []float64{240, 480, 720, 960, 1200, 1366} {
+		start := vt - offset
+		if start+30 > dubDur {
+			continue
+		}
+		refs = append(refs, RefWindow{VideoTime: vt, Envelope: makeEnvelope(sliceEnv(dub, start, 30))})
+	}
+	res, err := Align(makeEnvelope(dub), refs, videoDur, dubDur, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(res.Offset-offset) > 0.1 {
+		t.Fatalf("offset = %.3f, want %.2f", res.Offset, offset)
+	}
+	if len(res.Cuts) != 0 {
+		t.Fatalf("false cuts detected: %+v", res.Cuts)
+	}
+	if !res.Uniform {
+		t.Fatal("result marked non-uniform")
+	}
+	if res.LeadGap != 0 {
+		t.Fatalf("unexpected lead gap %.2f", res.LeadGap)
+	}
+	if res.Segments[0].Kind != Dub || math.Abs(res.Segments[0].SourceStart-5.53) > 0.1 {
+		t.Fatalf("first segment = %+v, want dub from its intro", res.Segments[0])
+	}
+	var covered float64
+	for _, s := range res.Segments {
+		covered += s.End - s.Start
+	}
+	if math.Abs(covered-videoDur) > 0.01 {
+		t.Fatalf("segments cover %.2f of %.2f", covered, videoDur)
+	}
+}
+
+// TestBuildCutsRejectsImpossibleLeadingGroup checks the duration guard: a dub
+// cannot lose 16 s when its duration differs from the video by less than 1 s.
+func TestBuildCutsRejectsImpossibleLeadingGroup(t *testing.T) {
+	anchors := []Anchor{
+		{VideoTime: 0, Offset: -1285.11, Score: 0.58},
+		{VideoTime: 8, Offset: -15.14, Score: 0.62},
+		{VideoTime: 16, Offset: -5.53, Score: 0.56},
+		{VideoTime: 24, Offset: -5.53, Score: 0.56},
+		{VideoTime: 240, Offset: -5.53, Score: 0.77},
+		{VideoTime: 480, Offset: -5.53, Score: 0.85},
+		{VideoTime: 720, Offset: -5.53, Score: 0.77},
+		{VideoTime: 1200, Offset: -5.53, Score: 0.82},
+		{VideoTime: 1346, Offset: -5.53, Score: 0.85},
+	}
+	cuts, segments := buildCuts(anchors, 1377.168, -4.639, -5.53)
+	if len(cuts) != 0 || segments != nil {
+		t.Fatalf("cuts = %+v, segments = %+v", cuts, segments)
+	}
+}
+
+// TestBuildCutsKeepsGenuineCut guards against over-filtering: a real 5 s cut
+// is still found even when a false leading group is present.
+func TestBuildCutsKeepsGenuineCut(t *testing.T) {
+	anchors := []Anchor{
+		{VideoTime: 0, Offset: -772.4, Score: 0.50},
+		{VideoTime: 8, Offset: -766.7, Score: 0.63},
+		{VideoTime: 30, Offset: -6.6, Score: 0.95},
+		{VideoTime: 120, Offset: -6.6, Score: 0.95},
+		{VideoTime: 210, Offset: -1.6, Score: 0.95},
+		{VideoTime: 330, Offset: -1.6, Score: 0.95},
+	}
+	cuts, segments := buildCuts(anchors, 400, -1.6, -6.6)
+	if len(cuts) != 1 {
+		t.Fatalf("cuts = %+v", cuts)
+	}
+	if math.Abs(cuts[0].Removed-5) > 0.2 {
+		t.Fatalf("removed = %.2f, want 5", cuts[0].Removed)
+	}
+	if len(segments) < 2 || segments[0].Kind != Dub || segments[0].Start != 0 {
+		t.Fatalf("segments = %+v", segments)
+	}
+}
+
 func TestAlignPadsTailWithOriginal(t *testing.T) {
 	const offset = -6.6
 	const videoDur = 400.0
